@@ -1,0 +1,43 @@
+package storage
+
+import (
+	"encoding/binary"
+	"errors"
+	"math"
+	"time"
+
+	"github.com/0xc0d3d00d/candledb/internal/domain"
+)
+
+const candleByteSize = 48
+
+func encodeCandle(candle *domain.Candle) []byte {
+	buf := make([]byte, candleByteSize)
+
+	timestamp := candle.Timestamp.UnixNano()
+
+	binary.LittleEndian.PutUint64(buf, uint64(timestamp))
+	binary.LittleEndian.PutUint64(buf[8:], math.Float64bits(candle.Open))
+	binary.LittleEndian.PutUint64(buf[16:], math.Float64bits(candle.High))
+	binary.LittleEndian.PutUint64(buf[24:], math.Float64bits(candle.Low))
+	binary.LittleEndian.PutUint64(buf[32:], math.Float64bits(candle.Close))
+	binary.LittleEndian.PutUint64(buf[40:], uint64(candle.Volume))
+
+	return buf
+}
+
+func decodeCandle(buf []byte, candle *domain.Candle) error {
+	if len(buf) != candleByteSize {
+		return errors.New("invalid buffer size")
+	}
+
+	timestamp := binary.LittleEndian.Uint64(buf[:8])
+	candle.Timestamp = time.Unix(0, int64(timestamp))
+	candle.Open = math.Float64frombits(binary.LittleEndian.Uint64(buf[8:16]))
+	candle.High = math.Float64frombits(binary.LittleEndian.Uint64(buf[16:24]))
+	candle.Low = math.Float64frombits(binary.LittleEndian.Uint64(buf[24:32]))
+	candle.Close = math.Float64frombits(binary.LittleEndian.Uint64(buf[32:40]))
+	candle.Volume = int64(binary.LittleEndian.Uint64(buf[40:]))
+
+	return nil
+}
