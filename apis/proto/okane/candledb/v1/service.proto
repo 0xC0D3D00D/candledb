@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package okane.candledb.v1;
+
+import "google/api/annotations.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+import "okane/candledb/v1/candle.proto";
+
+// CandleDB service rpcs
+service CandleDBService {
+  // Save candles in the database
+  rpc SaveCandles(SaveCandlesRequest) returns (SaveCandlesResponse) {
+    option idempotency_level = IDEMPOTENT;
+    option (google.api.http) = {put: "/v1/candles"};
+  }
+  // Get candles from the database
+  rpc GetCandles(GetCandlesRequest) returns (GetCandlesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+    option (google.api.http) = {get: "/v1/candles"};
+  }
+}
+
+// Save candles request
+message SaveCandlesRequest {
+  // List of candles to save
+  repeated Candle candles = 1;
+}
+
+// Save candles response
+message SaveCandlesResponse {}
+
+// Get candles request
+message GetCandlesRequest {
+  // Ticker identifier
+  string ticker_id = 1;
+  // Resoultion of the candles
+  google.protobuf.Duration resolution = 2;
+  // Start time of the candles to get
+  google.protobuf.Timestamp start_time = 3;
+  // End time of the candles to get
+  google.protobuf.Timestamp end_time = 4;
+}
+
+// Get candles response
+message GetCandlesResponse {
+  // List of candles
+  repeated Candle candles = 1;
+}

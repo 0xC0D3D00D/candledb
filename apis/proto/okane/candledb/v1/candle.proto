@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package okane.candledb.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// Represents a candle
+message Candle {
+  // Timestamp
+  google.protobuf.Timestamp timestamp = 1;
+  // Ticker identifier
+  string ticker_id = 2;
+  // Resolution of the candle aggregation
+  google.protobuf.Duration resolution = 3;
+  // Opening price
+  double open = 4;
+  // Highest price
+  double high = 5;
+  // Lowest price
+  double low = 6;
+  // Closing price
+  double close = 8;
+  // Trading volume (units)
+  int64 volume = 9;
+}
+

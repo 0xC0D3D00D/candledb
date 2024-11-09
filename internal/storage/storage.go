@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"path"
 	"sort"
 	"strconv"
@@ -15,13 +16,15 @@ import (
 	"github.com/spf13/afero"
 )
 
+var ErrNoCandlesFound = fmt.Errorf("no candles found")
+
 type set[M comparable] map[M]struct{}
 
 func (s set[M]) add(v M) {
 	s[v] = struct{}{}
 }
 
-const oneDay = time.Hour * 24
+const oneWeek = time.Hour * 24 * 7
 
 type timeRange struct {
 	from time.Time
@@ -34,6 +37,10 @@ func (tr timeRange) contains(t time.Time) bool {
 
 func (t1 timeRange) containsRange(t2 timeRange) bool {
 	return (t1.from.Equal(t2.from) || t1.from.Before(t2.from)) && t1.to.After(t2.to)
+}
+
+func (t1 timeRange) intersects(t2 timeRange) bool {
+	return t1.from.Before(t2.to) && t1.to.After(t2.from)
 }
 
 type seriesKey struct {
@@ -55,7 +62,7 @@ type storage struct {
 	candleFiles      map[candleFileKey]afero.File
 	candleFilesMutex *sync.RWMutex
 	// TODO: build binary search tree for time ranges
-	timeRanges       []timeRange
+	seriesTimeRanges map[seriesKey][]timeRange
 	chunkCandleCount int
 }
 
@@ -126,6 +133,7 @@ func NewStorage(rootDir string, chunkCandleCount int) (*storage, error) {
 
 	candleFiles := make(map[candleFileKey]afero.File)
 	for _, tickerIdResolution := range tickerIdResolutions {
+		slog.Debug("tickerIdResolution", "name", tickerIdResolution.Name())
 		tickerIdResolutionDir := path.Join(dataDir, tickerIdResolution.Name())
 		candles, err := afero.ReadDir(fs, tickerIdResolutionDir)
 		if err != nil {
@@ -176,23 +184,29 @@ func NewStorage(rootDir string, chunkCandleCount int) (*storage, error) {
 					resolution: resolution,
 				},
 				timeRange: timeRange{
-					from: time.UnixMicro(from),
-					to:   time.UnixMicro(to),
+					from: time.UnixMicro(from).UTC(),
+					to:   time.UnixMicro(to).UTC(),
 				},
 			}
+			slog.Debug("candleFileKey", "key", key)
 
 			candleFiles[key] = candleFile
 		}
 	}
 
-	timeRanges := make([]timeRange, 0, len(candleFiles))
+	timeRanges := make(map[seriesKey][]timeRange)
 	for candleKey := range candleFiles {
-		timeRanges = append(timeRanges, candleKey.timeRange)
+		if _, ok := timeRanges[candleKey.seriesKey]; !ok {
+			timeRanges[candleKey.seriesKey] = []timeRange{}
+		}
+		timeRanges[candleKey.seriesKey] = append(timeRanges[candleKey.seriesKey], candleKey.timeRange)
 	}
 
-	sort.Slice(timeRanges, func(i, j int) bool {
-		return timeRanges[i].from.Before(timeRanges[j].from)
-	})
+	for _, ranges := range timeRanges {
+		sort.Slice(ranges, func(i, j int) bool {
+			return ranges[i].from.Before(ranges[j].from)
+		})
+	}
 
 	return &storage{
 		fs:          fs,
@@ -204,16 +218,76 @@ func NewStorage(rootDir string, chunkCandleCount int) (*storage, error) {
 
 		candleFilesMutex: &sync.RWMutex{},
 
-		timeRanges:       timeRanges,
+		seriesTimeRanges: timeRanges,
 		chunkCandleCount: chunkCandleCount,
 	}, nil
 }
 
 func (s *storage) GetCandles(ctx context.Context, tickerId string, resolution domain.Resolution, from time.Time, to time.Time) ([]*domain.Candle, error) {
-	panic("not implemented")
+	slog.DebugContext(ctx, "get candles", "ticker_id", tickerId, "resolution", resolution, "from", from, "to", to)
+	seriesKey := seriesKey{
+		tickerId:   tickerId,
+		resolution: resolution,
+	}
+
+	selectRange := timeRange{from: from, to: to}
+	timeRanges := make([]timeRange, 0, len(s.seriesTimeRanges[seriesKey]))
+	for _, tr := range s.seriesTimeRanges[seriesKey] {
+		if tr.intersects(selectRange) {
+			timeRanges = append(timeRanges, tr)
+		}
+	}
+
+	slog.DebugContext(ctx, "get candles", "time_ranges", timeRanges)
+
+	if len(timeRanges) == 0 {
+		return nil, ErrNoCandlesFound
+	}
+
+	timeRange := timeRanges[0]
+	key := candleFileKey{
+		seriesKey: seriesKey,
+		timeRange: timeRange,
+	}
+
+	_, err := s.candleFiles[key].Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fmt.Errorf("failed to seek to the start of the candle file: %w", err)
+	}
+
+	// FIXME: Read only the necessary data
+	candlesBinary := make([]byte, s.chunkCandleCount*candleByteSize)
+	_, err = io.ReadFull(s.candleFiles[key], candlesBinary)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read candle file: %w", err)
+	}
+
+	slog.Debug("candlesBinary", "len", len(candlesBinary))
+
+	candles := make([]*domain.Candle, 0, s.chunkCandleCount)
+	for i := 0; i < s.chunkCandleCount; i++ {
+		var candle domain.Candle
+		err := decodeCandle(candlesBinary[i*candleByteSize:(i+1)*candleByteSize], &candle)
+		if err == ErrCandleNotWritten {
+			continue
+		}
+		slog.Debug("decodeCandle", "candle", candle, "err", err, "idx", i)
+		if err != nil {
+			return nil, err
+		}
+
+		candle.TickerId = seriesKey.tickerId
+		candle.Resolution = seriesKey.resolution
+		candles = append(candles, &candle)
+	}
+
+	slog.DebugContext(ctx, "get candles", "candle_count", len(candles))
+
+	return candles, nil
 }
 
 func (s *storage) SaveCandles(ctx context.Context, candles []*domain.Candle) error {
+	slog.DebugContext(ctx, "save candles", "count", len(candles))
 	candleBySeries := make(map[seriesKey][]*domain.Candle)
 	for _, candle := range candles {
 		key := seriesKey{
@@ -231,10 +305,35 @@ func (s *storage) SaveCandles(ctx context.Context, candles []*domain.Candle) err
 		return err
 	}
 
+	candleByFile := make(map[candleFileKey][]*domain.Candle)
+	for _, candle := range candles {
+		key := candleFileKey{
+			seriesKey: seriesKey{
+				tickerId:   candle.TickerId,
+				resolution: candle.Resolution,
+			},
+			timeRange: s.calcTimeRangeForTimestamp(candle.Resolution, candle.Timestamp),
+		}
+
+		if _, ok := candleByFile[key]; !ok {
+			candleByFile[key] = []*domain.Candle{}
+		}
+
+		candleByFile[key] = append(candleByFile[key], candle)
+	}
+
+	for key, candles := range candleByFile {
+		err = s.saveCandlesByFile(key, candles)
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
 func (s *storage) allocateCandleFiles(ctx context.Context, candleBySeries map[seriesKey][]*domain.Candle) error {
+	slog.DebugContext(ctx, "allocateCandleFiles", "series_count", len(candleBySeries))
 	seriesKeys := s.buildSeriesPlan(ctx, candleBySeries)
 
 	for _, key := range seriesKeys {
@@ -246,12 +345,76 @@ func (s *storage) allocateCandleFiles(ctx context.Context, candleBySeries map[se
 	return nil
 }
 
+func (s *storage) saveCandlesByFile(fileKey candleFileKey, candles []*domain.Candle) error {
+	slog.Debug("saveCandlesByFile", "file_key", fileKey, "candle_count", len(candles))
+	// FIXME: lock should be more fine-grained
+	s.candleFilesMutex.Lock()
+	defer s.candleFilesMutex.Unlock()
+
+	sort.Slice(candles, func(i, j int) bool {
+		return candles[i].Timestamp.Before(candles[j].Timestamp)
+	})
+
+	candleFile := s.candleFiles[fileKey]
+	if candleFile == nil {
+		panic("candle file not found")
+	}
+
+	for _, candle := range candles {
+		err := s.saveCandleByFile(fileKey, candleFile, candle)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *storage) saveCandleByFile(fileKey candleFileKey, candleFile afero.File, candle *domain.Candle) error {
+	slog.Debug("saveCandleByFile", "file_key", fileKey, "candle", candle)
+	encoded := encodeCandle(candle)
+	offset := int64(candle.Timestamp.Sub(fileKey.timeRange.from) / time.Duration(fileKey.seriesKey.resolution))
+	slog.Debug("saveCandleByFile", "from", fileKey.timeRange.from, "cdl_ts", candle.Timestamp, "offset", offset)
+
+	err := s.writeCandleUpsert(fileKey, candle, offset, false)
+	if err != nil {
+		return err
+	}
+
+	n, err := candleFile.Seek(offset*candleByteSize, io.SeekStart)
+	if n != offset*candleByteSize && err == nil {
+		return fmt.Errorf("failed to seek to the offset: %w", io.ErrShortWrite)
+	}
+
+	written, err := candleFile.Write(encoded)
+	if written != candleByteSize && err == nil {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		return err
+	}
+
+	return s.writeCandleUpsert(fileKey, candle, offset, true)
+}
+
 func (s *storage) allocateCandleFile(ctx context.Context, key candleFileKey) error {
+	slog.DebugContext(ctx, "allocateCandleFile", "key", key)
+	seriesDir := path.Join(s.dataDir, fmt.Sprintf("%s_%s", key.seriesKey.tickerId, key.seriesKey.resolution))
 	filename := path.Join(
-		s.dataDir,
-		fmt.Sprintf("%s_%s", key.seriesKey.tickerId, key.seriesKey.resolution),
+		seriesDir,
 		fmt.Sprintf("%d_%d.bin", key.timeRange.from.UnixMicro(), key.timeRange.to.UnixMicro()),
 	)
+
+	exists, err := afero.Exists(s.fs, seriesDir)
+	if err != nil {
+		return fmt.Errorf("failed to check if series directory exists: %w", err)
+	}
+	if !exists {
+		err = s.fs.MkdirAll(seriesDir, 0755)
+		if err != nil {
+			return fmt.Errorf("failed to create series directory: %w", err)
+		}
+	}
 
 	candleFile, err := s.fs.Create(filename)
 	if err != nil {
@@ -271,12 +434,14 @@ func (s *storage) allocateCandleFile(ctx context.Context, key candleFileKey) err
 
 	s.candleFilesMutex.Lock()
 	s.candleFiles[key] = candleFile
+	s.seriesTimeRanges[key.seriesKey] = append(s.seriesTimeRanges[key.seriesKey], key.timeRange)
 	s.candleFilesMutex.Unlock()
 
 	return nil
 }
 
 func (s *storage) buildSeriesPlan(ctx context.Context, candleBySeries map[seriesKey][]*domain.Candle) []candleFileKey {
+	slog.DebugContext(ctx, "buildSeriesPlan", "series_count", len(candleBySeries))
 	candleFileKeys := []candleFileKey{}
 	for series, candles := range candleBySeries {
 		ranges := s.buildMissingRanges(ctx, series, candles)
@@ -293,11 +458,12 @@ func (s *storage) buildSeriesPlan(ctx context.Context, candleBySeries map[series
 }
 
 func (s *storage) buildMissingRanges(ctx context.Context, series seriesKey, candles []*domain.Candle) []timeRange {
+	slog.DebugContext(ctx, "buildMissingRanges", "series", series, "candle_count", len(candles))
 	uncoveredTimestamps := []time.Time{}
 
 	for _, candle := range candles {
 		contained := false
-		for _, timeRange := range s.timeRanges {
+		for _, timeRange := range s.seriesTimeRanges[series] {
 			if timeRange.from.After(candle.Timestamp) {
 				break
 			}
@@ -316,19 +482,14 @@ func (s *storage) buildMissingRanges(ctx context.Context, series seriesKey, cand
 		return uncoveredTimestamps[i].Before(uncoveredTimestamps[j])
 	})
 
-	chunkSize := s.chunkSize(series.resolution)
+	return s.calcTimeRangesForTimestamps(series.resolution, uncoveredTimestamps)
+}
 
-	// For large time ranges, we store them by year
-	if chunkSize > oneDay {
-		return buildYearlyRanges(uncoveredTimestamps)
-	}
-
-	timeRangeSet := map[timeRange]struct{}{}
-	for _, t := range uncoveredTimestamps {
-		timeRangeSet[timeRange{
-			from: t.Truncate(chunkSize),
-			to:   t.Truncate(chunkSize).Add(chunkSize),
-		}] = struct{}{}
+func (s *storage) calcTimeRangesForTimestamps(resolution domain.Resolution, timestamps []time.Time) []timeRange {
+	slog.Debug("calcTimeRangesForTimestamps", "resolution", resolution, "timestamp_count", len(timestamps))
+	timeRangeSet := set[timeRange]{}
+	for _, t := range timestamps {
+		timeRangeSet.add(s.calcTimeRangeForTimestamp(resolution, t))
 	}
 
 	timeRanges := make([]timeRange, 0, len(timeRangeSet))
@@ -339,37 +500,28 @@ func (s *storage) buildMissingRanges(ctx context.Context, series seriesKey, cand
 	return timeRanges
 }
 
-func buildYearlyRanges(timestamps []time.Time) []timeRange {
-	years := make(set[int])
+func (s *storage) calcTimeRangeForTimestamp(resolution domain.Resolution, timestamp time.Time) timeRange {
+	slog.Debug("calcTimeRangeForTimestamp", "resolution", resolution, "timestamp", timestamp)
+	chunkSize := s.chunkSize(resolution)
 
-	for _, t := range timestamps {
-		years.add(t.Year())
+	// For large time ranges, we store them by year
+	if chunkSize > oneWeek {
+		return buildYearlyRange(timestamp.Year())
 	}
 
-	timeRanges := []timeRange{}
-	for year := range years {
-		timeRanges = append(timeRanges, timeRange{
-			from: time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC),
-			to:   time.Date(year+1, 1, 1, 0, 0, 0, 0, time.UTC),
-		})
+	return timeRange{
+		from: timestamp.Truncate(chunkSize),
+		to:   timestamp.Truncate(chunkSize).Add(chunkSize),
 	}
+}
 
-	return timeRanges
+func buildYearlyRange(year int) timeRange {
+	return timeRange{
+		from: time.Date(year, 1, 1, 0, 0, 0, 0, time.UTC),
+		to:   time.Date(year+1, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
 }
 
 func (s *storage) chunkSize(resolution domain.Resolution) time.Duration {
 	return time.Duration(resolution) * time.Duration(s.chunkCandleCount)
-}
-
-func (s *storage) doesRangeExists(timestamp time.Time) bool {
-	for _, tr := range s.timeRanges {
-		if timestamp.After(tr.to) {
-			break
-		}
-		if timestamp.After(tr.from) && timestamp.Before(tr.to) {
-			return true
-		}
-	}
-
-	return false
 }
