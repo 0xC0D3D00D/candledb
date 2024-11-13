@@ -61,8 +61,10 @@ func encodeUpsertCandleLog(log upsertCandleLog) ([]byte, error) {
 }
 
 func (s *storage) writeCandleUpsert(fileKey candleFileKey, candle *domain.Candle, offset int64, written bool) error {
-	// FIXME: fix wal issue and enable it
-	return nil
+	if s.disableWal {
+		return nil
+	}
+
 	log := upsertCandleLog{
 		timestamp: time.Now(),
 		fileKey:   fileKey,

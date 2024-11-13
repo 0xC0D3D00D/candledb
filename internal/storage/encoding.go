@@ -39,7 +39,7 @@ func decodeCandle(buf []byte, candle *domain.Candle) error {
 	}
 
 	timestamp := binary.LittleEndian.Uint64(buf[:8])
-	candle.Timestamp = time.Unix(0, int64(timestamp))
+	candle.Timestamp = time.Unix(0, int64(timestamp)).UTC()
 	candle.Open = math.Float64frombits(binary.LittleEndian.Uint64(buf[8:16]))
 	candle.High = math.Float64frombits(binary.LittleEndian.Uint64(buf[16:24]))
 	candle.Low = math.Float64frombits(binary.LittleEndian.Uint64(buf[24:32]))

@@ -23,6 +23,7 @@ import (
 type config struct {
 	DataDir       string `env:"DATA_DIR" envDefault:"./data"`
 	ListenAddress string `env:"ADDR" envDefault:":6969"`
+	DisableWal    bool   `env:"DISABLE_WAL" envDefault:"false"`
 }
 
 func main() {
@@ -44,7 +45,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := storage.NewStorage(cfg.DataDir, 10000)
+	db, err := storage.NewStorage(cfg.DataDir, cfg.DisableWal, 10000)
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to create storage", "error", err)
 		os.Exit(1)

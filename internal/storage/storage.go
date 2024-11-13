@@ -74,6 +74,7 @@ type storage struct {
 	// TODO: build binary search tree for time ranges
 	seriesTimeRanges map[seriesKey][]timeRange
 	chunkCandleCount int
+	disableWal       bool
 }
 
 // wals
@@ -85,7 +86,7 @@ type storage struct {
 // - snapshot
 //   - snapshot-1730155456000.tar.gz
 
-func NewStorage(rootDir string, chunkCandleCount int) (*storage, error) {
+func NewStorage(rootDir string, disableWal bool, chunkCandleCount int) (*storage, error) {
 	fs := afero.NewOsFs()
 
 	rootExists, err := afero.DirExists(fs, rootDir)
@@ -98,9 +99,11 @@ func NewStorage(rootDir string, chunkCandleCount int) (*storage, error) {
 	snapshotDir := path.Join(rootDir, "snapshot")
 
 	if !rootExists {
-		err = fs.MkdirAll(walDir, 0755)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create wal directory: %w", err)
+		if !disableWal {
+			err = fs.MkdirAll(walDir, 0755)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create wal directory: %w", err)
+			}
 		}
 
 		err = fs.MkdirAll(dataDir, 0755)
@@ -114,29 +117,31 @@ func NewStorage(rootDir string, chunkCandleCount int) (*storage, error) {
 		}
 	}
 
-	wals, err := afero.ReadDir(fs, walDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read wal directory: %w", err)
-	}
-
-	walFiles := make(map[string]afero.File, len(wals)+1)
-	for _, wal := range wals {
-		walFile, err := fs.Open(path.Join(walDir, wal.Name()))
+	walFiles := make(map[string]afero.File)
+	if !disableWal {
+		wals, err := afero.ReadDir(fs, walDir)
 		if err != nil {
-			return nil, fmt.Errorf("failed to open wal `%s` file: %w", wal.Name(), err)
+			return nil, fmt.Errorf("failed to read wal directory: %w", err)
 		}
 
-		walFiles[wal.Name()] = walFile
-	}
+		for _, wal := range wals {
+			walFile, err := fs.Open(path.Join(walDir, wal.Name()))
+			if err != nil {
+				return nil, fmt.Errorf("failed to open wal `%s` file: %w", wal.Name(), err)
+			}
 
-	if len(wals) == 0 {
-		filename := fmt.Sprintf("%010d.wal", 1)
-		walFile, err := fs.Create(path.Join(walDir, filename))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create wal file: %w", err)
+			walFiles[wal.Name()] = walFile
 		}
 
-		walFiles[filename] = walFile
+		if len(wals) == 0 {
+			filename := fmt.Sprintf("%010d.wal", 1)
+			walFile, err := fs.Create(path.Join(walDir, filename))
+			if err != nil {
+				return nil, fmt.Errorf("failed to create wal file: %w", err)
+			}
+
+			walFiles[filename] = walFile
+		}
 	}
 
 	tickerIdResolutions, err := afero.ReadDir(fs, dataDir)
@@ -230,6 +235,7 @@ func NewStorage(rootDir string, chunkCandleCount int) (*storage, error) {
 
 		seriesTimeRanges: timeRanges,
 		chunkCandleCount: chunkCandleCount,
+		disableWal:       disableWal,
 	}, nil
 }
 
