@@ -16,7 +16,7 @@ import (
 	"github.com/spf13/afero"
 )
 
-var ErrNoCandlesFound = fmt.Errorf("no candles found")
+var ErrNoCandlesFound = fmt.Errorf("%w: no candles found", domain.ErrNotFound)
 
 type set[M comparable] map[M]struct{}
 
@@ -40,7 +40,17 @@ func (t1 timeRange) containsRange(t2 timeRange) bool {
 }
 
 func (t1 timeRange) intersects(t2 timeRange) bool {
-	return t1.from.Before(t2.to) && t1.to.After(t2.from)
+	// t2.from < t1.from < t2.to
+	// t2.from < t1.to   < t2.to
+	// OR
+	// t1.from < t2.from < t1.to
+	// t1.from < t2.to   < t1.to
+
+	return (t1.from.After(t2.from) && t1.from.Before(t2.to)) ||
+		(t1.to.After(t2.from) && t1.from.Before(t2.to)) ||
+		(t2.from.After(t1.from) && t2.from.Before(t1.to)) ||
+		(t2.to.After(t1.from) && t2.from.Before(t1.to))
+
 }
 
 type seriesKey struct {
@@ -233,6 +243,7 @@ func (s *storage) GetCandles(ctx context.Context, tickerId string, resolution do
 	selectRange := timeRange{from: from, to: to}
 	timeRanges := make([]timeRange, 0, len(s.seriesTimeRanges[seriesKey]))
 	for _, tr := range s.seriesTimeRanges[seriesKey] {
+		slog.DebugContext(ctx, "time range", "from", tr.from, "to", tr.to)
 		if tr.intersects(selectRange) {
 			timeRanges = append(timeRanges, tr)
 		}
@@ -244,12 +255,24 @@ func (s *storage) GetCandles(ctx context.Context, tickerId string, resolution do
 		return nil, ErrNoCandlesFound
 	}
 
-	timeRange := timeRanges[0]
-	key := candleFileKey{
-		seriesKey: seriesKey,
-		timeRange: timeRange,
+	candles := make([]*domain.Candle, 0, s.chunkCandleCount*len(timeRanges))
+	for _, timeRange := range timeRanges {
+		key := candleFileKey{
+			seriesKey: seriesKey,
+			timeRange: timeRange,
+		}
+		rangeCandles, err := s.getCandlesByKey(ctx, key, from, to)
+		if err != nil {
+			return nil, err
+		}
+		candles = append(candles, rangeCandles...)
 	}
 
+	slog.DebugContext(ctx, "get candles", "candle_count", len(candles))
+	return candles, nil
+}
+
+func (s *storage) getCandlesByKey(ctx context.Context, key candleFileKey, from time.Time, to time.Time) ([]*domain.Candle, error) {
 	_, err := s.candleFiles[key].Seek(0, io.SeekStart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to seek to the start of the candle file: %w", err)
@@ -262,8 +285,7 @@ func (s *storage) GetCandles(ctx context.Context, tickerId string, resolution do
 		return nil, fmt.Errorf("failed to read candle file: %w", err)
 	}
 
-	slog.Debug("candlesBinary", "len", len(candlesBinary))
-
+	slog.DebugContext(ctx, "getting candles for range", "range.from", key.timeRange.from, "range.to", key.timeRange.to, "request.from", from, "request.to", to)
 	candles := make([]*domain.Candle, 0, s.chunkCandleCount)
 	for i := 0; i < s.chunkCandleCount; i++ {
 		var candle domain.Candle
@@ -271,19 +293,23 @@ func (s *storage) GetCandles(ctx context.Context, tickerId string, resolution do
 		if err == ErrCandleNotWritten {
 			continue
 		}
-		slog.Debug("decodeCandle", "candle", candle, "err", err, "idx", i)
 		if err != nil {
 			return nil, err
 		}
 
-		candle.TickerId = seriesKey.tickerId
-		candle.Resolution = seriesKey.resolution
+		// FIXME: Read only the necessary data
+		if candle.Timestamp.Before(from) || candle.Timestamp.After(to) {
+			continue
+		}
+		slog.Debug("decodeCandle", "candle", candle, "err", err, "idx", i)
+
+		candle.TickerId = key.seriesKey.tickerId
+		candle.Resolution = key.seriesKey.resolution
 		candles = append(candles, &candle)
 	}
 
-	slog.DebugContext(ctx, "get candles", "candle_count", len(candles))
-
 	return candles, nil
+
 }
 
 func (s *storage) SaveCandles(ctx context.Context, candles []*domain.Candle) error {
@@ -372,6 +398,7 @@ func (s *storage) saveCandlesByFile(fileKey candleFileKey, candles []*domain.Can
 
 func (s *storage) saveCandleByFile(fileKey candleFileKey, candleFile afero.File, candle *domain.Candle) error {
 	slog.Debug("saveCandleByFile", "file_key", fileKey, "candle", candle)
+	candle.Timestamp = candle.Timestamp.Truncate(time.Duration(candle.Resolution))
 	encoded := encodeCandle(candle)
 	offset := int64(candle.Timestamp.Sub(fileKey.timeRange.from) / time.Duration(fileKey.seriesKey.resolution))
 	slog.Debug("saveCandleByFile", "from", fileKey.timeRange.from, "cdl_ts", candle.Timestamp, "offset", offset)

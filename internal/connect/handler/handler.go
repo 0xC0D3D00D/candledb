@@ -32,7 +32,7 @@ func (h *handler) SaveCandles(ctx context.Context, req *connect.Request[candledb
 	err := h.candledb.SaveCandles(ctx, toDomainCandles(req.Msg.Candles))
 	if err != nil {
 		// FIXME: return correct error code
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errorToProto(err)
 	}
 	return connect.NewResponse(&candledbv1.SaveCandlesResponse{}), nil
 }
@@ -48,7 +48,7 @@ func (h *handler) GetCandles(ctx context.Context, req *connect.Request[candledbv
 
 	if err != nil {
 		// FIXME: return correct error code
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, errorToProto(err)
 	}
 
 	return connect.NewResponse(&candledbv1.GetCandlesResponse{Candles: toProtoCandles(candles)}), nil

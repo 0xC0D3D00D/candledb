@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"errors"
 	"time"
 
+	"connectrpc.com/connect"
 	candledbv1 "github.com/0xc0d3d00d/candledb/apis/gen/go/okane/candledb/v1"
 	"github.com/0xc0d3d00d/candledb/internal/domain"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -66,5 +68,14 @@ func toProtoCandle(c *domain.Candle) *candledbv1.Candle {
 		Low:        c.Low,
 		Close:      c.Close,
 		Volume:     c.Volume,
+	}
+}
+
+func errorToProto(err error) *connect.Error {
+	switch {
+	case errors.Is(err, domain.ErrNotFound):
+		return connect.NewError(connect.CodeNotFound, err)
+	default:
+		return connect.NewError(connect.CodeUnknown, err)
 	}
 }
